@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+# coding=utf-8
+
+import os
+import pathlib
+import argparse
+import json
+import logging
+import asyncio
+import time
+from configparser import ConfigParser
+import re
+from typing import Optional, Union
+import textwrap
+
+
+GITSRC = ".gitsrc.json"
+
+
+class GitsManager:
+    def __init__(self, pwd: str = "."):
+        assert os.path.isdir(pwd)
+        self.pwd = os.path.abspath(pwd)
+        self.gitsrc = os.path.join(self.pwd, GITSRC)
+
+        self.repos = {}
+        self.config_load()
+
+    def config_load(self):
+        if os.path.exists(self.gitsrc):
+            with open(self.gitsrc, 'r') as f:
+                self.repos = json.load(f)
+
+    def config_show(self):
+        """
+        Last Update: @2024-11-27 10:40:35
+        ---------------------------------
+        Show all git repository names recorded in gitsrc, if the path doesn't exist any more, it will be shown in red
+        """
+
+        if not self.repos:
+            logger.info("No repos found!")
+            return
+
+        nonexist_flag = False
+
+        for name, rec in self.repos.items():
+            if (pathlib.Path(rec["path"]) / ".git").is_dir():
+                print(name)
+                print(f"  \x1b[33mlabels:\x1b[0m \x1b[3m{rec['labels']}\x1b[0m")
+            else:
+                nonexist_flag = True
+                print(f"\033[31m{name}\033[0m")
+        if nonexist_flag:
+            print("--------------------------")
+            print("Some repositories are missing!")
+
+    def config_gen(self, mode: str = "w"):
+        """
+        Last Update: @2024-11-02 17:32:58
+        ---------------------------------
+        Generate gitsrc file according to the working directory
+
+        :param mode: if set to "w", will overwrite existing gitsrc file; if set to "a", will update existing gitsrc file
+        """
+        repos = {}
+        for directory in pathlib.Path(".").absolute().iterdir():
+            if (directory / ".git").exists():
+                repos[directory.name] = {
+                    "name": directory.name,
+                    "path": directory.as_posix(),
+                    "branches": [],
+                    "remotes": [],
+                    "labels": []
+                }
+        if mode == "w":
+            self.repos = repos
+        elif mode == "a":
+            self.repos.update(repos)
+        else:
+            raise UnReachableError()
+
+        with open(self.gitsrc, "w") as f:
+            json.dump(self.repos, f, indent=4)
+
+    def config_add(self, keys: list[str]):
+        """
+        Last Update: @2024-11-02 21:04:10
+        ---------------------------------
+        """
+
+        for k in keys:
+            self.repos.update(GitsManager.get_repo_info(k))
+
+        self._save_repos()
+
+    def config_remove(self, keys):
+        for k in keys:
+            self.repos.pop(k)
+        # if remove_dir and os.path.isdir(repo["path"]):
+        #     shutil.rmtree(repo["path"])
+        self._save_repos()
+
+    def _save_repos(self):
+        with open(self.gitsrc, "w") as f:
+            json.dump(self.repos, f, indent=4)
+
+    def config_update(self):
+        invalid_names = []
+        for name, repo in self.repos.items():
+            if repo["path"] and not os.path.exists(repo["path"]):
+                invalid_names.append(name)
+                continue
+            self.repos[name].update(
+                GitsManager.get_repo_info(repo["path"][name]))
+
+    @staticmethod
+    def get_repo_info(repo: str):
+        def get_branches_and_remotes():
+            branches = []
+            remotes = []
+            ini_config = ConfigParser()
+            ini_config.read(str(repop / ".git/config"))
+            for sec in ini_config.sections():
+                if sec.startswith("branch "):
+                    rerst = re.search(r'".*"', sec)
+                    if not rerst:
+                        raise RuntimeError()
+                    branches.append(rerst.group()[1:-1])
+                elif sec.startswith("remote "):
+                    rerst = re.search(r'".*"', sec)
+                    if not rerst:
+                        raise RuntimeError()
+                    name = rerst.group()[1:-1]
+                    remotes.append({
+                        "name": name,
+                        "url": ini_config[sec]["url"]
+                    })
+            return branches, remotes
+
+        if (pathlib.Path(repo) / ".git").is_dir():
+            repop = pathlib.Path(repo)
+            branches, remotes = get_branches_and_remotes()
+
+            return {
+                repop.name: {
+                    "name": repop.name,
+                    "path": repop.as_posix(),
+                    "branches": branches,
+                    "remotes": remotes,
+                    "labels": []
+                }
+            }
+        elif ":" in repo:
+            url = repo
+            rerst = re.search(r"/.*\.git$", url)
+            if not rerst:
+                raise RuntimeError()
+            name = rerst.group()[1:-4]
+            rerst = re.search(r"[a-zA-Z0-9_]+\.com", url)
+            if not rerst:
+                raise RuntimeError()
+            remote_name = rerst.group()[:-4]
+            return {
+                name: {
+                    "name": name,
+                    "path": "",
+                    "remotes": [
+                        {
+                            "name": remote_name,
+                            "url": url
+                        }
+                    ],
+                    "branches": [],
+                    "labels": []
+                }
+            }
+        return {}
+
+    def status_show(self, label: Optional[list[str]] = None):
+        """
+        Last Update: @
+        ------------
+        Show status for each target git repository, including:
+           - name
+           - commit
+           - branch
+           - is clean?
+           - has untracked files?
+           - has unstaged changes?
+           - has staged changes?
+        """
+        sem = asyncio.Semaphore(args.max_concurrent)
+
+        def get_symbol(category: str, value: bool):
+            if category == "clean":
+                color_true = "\033[32m"
+            else:
+                color_true = "\033[31m"
+            if value:
+                return f"{color_true}√\033[0m"
+            else:
+                return "-"
+
+        def color_commit_id(commit_id: str):
+            assert len(commit_id) == 6
+            color = get_ANSI_color_from_6hex(commit_id)
+            return f"{color}{commit_id}\033[0m"
+
+        async def get_repo_status(r: dict):
+            """
+            Last Update: @2024-11-02 16:31:04
+            ---------------------------------
+            Resolve status for one git-repo via calling system comamnds asynchronously
+            """
+            async with sem:
+                # @ call-system | stdout content shuold looks like:
+                # @ branch
+                # @ ** filename
+                # @ ** filename
+                # @ ** filename
+                # @ ...
+                process = await asyncio.create_subprocess_shell(
+                    f"cd {r['path']}; git rev-parse --short HEAD; git rev-parse --abbrev-ref HEAD; git status --porcelain",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await process.communicate()
+                if process.returncode != 0:
+                    return
+
+                status = stdout.decode()
+
+                has_untracked = False
+                has_unstaged = False
+                has_staged = False
+                branch = ""
+                commitid = ""
+                for iL, line in enumerate(status.splitlines()):
+                    if iL == 0:
+                        commitid = line[:6]
+                        continue
+                    if iL == 1:
+                        branch = line.split(' ')[-1]
+                        continue
+                    if line.startswith('??'):  # Untracked files
+                        has_untracked = True
+                    elif line[1] != ' ':       # Changes not staged
+                        has_unstaged = True
+                    elif line[0] != ' ':       # Changes to be committed
+                        has_staged = True
+
+                r.update({
+                    'branch': branch,
+                    'commitid': commitid,
+                    'untracked': has_untracked,
+                    'unstaged': has_unstaged,
+                    'staged': has_staged,
+                    "clean": not (has_staged or has_unstaged or has_untracked)
+                })
+
+        async def collect_repo_status(repos):
+            await asyncio.gather(*[get_repo_status(r) for r in repos])
+
+        repos = self._get_repos_by_label(label)
+
+        if not repos:
+            logger.info("No matched repositories!")
+            return
+
+        start_time = time.perf_counter()
+        asyncio.run(collect_repo_status(repos))
+        duration = time.perf_counter() - start_time
+        print(
+            f"{'repo':<20}{'commit':<8}{'branch':<10}{'clean':<10}{'untracked':<15}{'unstaged':<15}{'staged':<10}")
+        for r in repos:
+            print(f"{r['name']:<20}{color_commit_id(r['commitid'])}{' '*2}{r['branch']:<10}{get_symbol('clean', r['clean'])}{' '*9}{get_symbol('untracked', r['untracked'])}{' ' * 14}{get_symbol('unstaged', r['unstaged'])}{' '*14}{get_symbol('staged', r['staged'])}{' '*9}")
+
+        print("--------------------------------------------")
+        print(f"\033[37mNCPUs used: {args.max_concurrent}")
+        print(f"Duration: {duration:.2f} seconds")
+        print(
+            f"Statement: gits status --repos {' '.join([r['name'] for r in repos])}\033[0m")
+
+    def pull(self, remote: str = "", branch: str = "", labels: Union[list, str, None] = None):
+        """
+        Last Update: @2024-11-26 11:46:17
+        ---------------------------------
+        Execute git push in batch
+        If the repo do pull changes from remote, status will be reported
+        """
+        repos, processes = self.exec(f"git pull {remote} {branch}", labels=labels, quiet=True)
+        for repo, proc in zip(repos, processes):
+            if proc.returncode != 0:
+                print(f"git pull \033[31mFailed\033[0m in {repo['name']}:")
+                print()
+                print(textwrap.indent(proc._stdeo, "    "))  # type: ignore
+                print()
+            else:
+                stdeo = proc._stdeo
+                if "Already up to date" in stdeo:
+                    continue
+                else:
+                    print(f"git pull \033[32mSucceed\033[0m in {repo['name']}")
+
+    def push(self, remote: str = "", branch: str = "", labels: Union[list, str, None] = None):
+        """
+        Last Update: @2024-11-26 11:46:17
+        ---------------------------------
+        Execute git push in batch
+        If the repo do push changes to remote, status will be reported
+        """
+        repos, processes = self.exec(f"git push {remote} {branch}", labels=labels, quiet=True)
+        for repo, proc in zip(repos, processes):
+            if proc.returncode != 0:
+                print(f"git push \033[31mFailed\033[0m in {repo['name']}:")
+                print()
+                print(textwrap.indent(proc._stdeo, "    "))  # type: ignore
+                print()
+            else:
+                stdeo = proc._stdeo
+                if "up-to-date" in stdeo:
+                    continue
+                else:
+                    print(f"git push \033[32mSucceed\033[0m in {repo['name']}")
+
+    def _get_repos_by_label(self, labels: Union[list, tuple, str] = None) -> list[dict]:
+        if labels is None:
+            return [repo for _, repo in self.repos.items() if repo["path"] != ""]
+
+        if isinstance(labels, (tuple, list)):
+            rst = []
+            for label in labels:
+                rst.extend(self._get_repos_by_label(label))
+            return rst
+
+        if not isinstance(labels, str):
+            raise TypeError
+
+        label = labels
+
+        if label in self.repos:
+            return [self.repos[label]] if self.repos[label]["path"] != "" else []
+
+        return [repo for _, repo in self.repos.items() if (repo["path"] != "" and (label is None or label in repo["labels"]))]
+
+    def clone(self, url):
+        pass
+
+    def add(self):
+        pass
+
+    def exec(self, command: str, labels=None, quiet: bool = False, show_eo: bool = False) -> Optional[tuple]:
+        """
+        Last Update: @2024-11-26 11:54:11
+        ---------------------------------
+        Execute commands in batch
+
+        :param command: target command to be run, use ";" to gather multiple commands
+        :param labels: Run commands in the target repos determined by the arg:labels
+        :param quiet: If set to True, will just return the result rather than handling them
+        :param show_eo: Print the stdout & stderr content if arg:quiet is False and arg:show_eo is True
+
+        :return: None or (repos, processes)
+        """
+        # @ Prepare
+        async def exec_cmd_in_one_repo(repo_dir):
+            async with asyncio.Semaphore(args.max_concurrent):
+                process = await asyncio.create_subprocess_shell(
+                    f"cd {repo_dir}; {command}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                stdout, _ = await process.communicate()
+                setattr(process, "_stdeo", stdout.decode())
+                return process
+
+        async def exec_cmd_gatherer(repos: list[dict]):
+            return await asyncio.gather(*[exec_cmd_in_one_repo(repo["path"]) for repo in repos])
+
+        # @ Main
+        repos = self._get_repos_by_label(labels)
+        logger.info(f">>> Executing command: '{command}' in repositories: {[r['name'] for r in repos]}")
+
+        processes = asyncio.run(exec_cmd_gatherer(repos))
+
+        # @ Post
+        # @ .return-results
+        if quiet:
+            return repos, processes
+
+        # @ .report-status
+        for repo, proc in zip(repos, processes):
+            if proc.returncode != 0:
+                print(f"command \033[31mFailed\033[0m in {repo['name']}, stdout & stderr is shown below:")
+                print(proc._stdeo)  # type: ignore
+                print()
+            else:
+                if not show_eo:
+                    print(f"command \033[32mSucceed\033[0m in {repo['name']}")
+                else:
+                    print(f"command \033[32mSucceed\033[0m in {repo['name']}, stdout & stderr is shown below:")
+                    print(proc._stdeo)  # type: ignore
+
+    def label_add(self, label: str, repos: list[str]):
+        for r in repos:
+            if r not in self.repos:
+                raise TypeError(f"Cannot find repo:{r} in current config!")
+            if label not in self.repos[r]["labels"]:
+                self.repos[r]["labels"].append(label)
+        self._save_repos()
+
+    def label_remove(self):
+        pass
+
+    def label_rename(self):
+        pass
+
+    def label_search(self):
+        pass
+
+
+def main():
+    pass
+
+
+class UnReachableError(Exception):
+    pass
+
+
+def get_ANSI_color_from_6hex(hex6: str):
+    def ab2int(ab: str):
+        val = eval("0x" + ab)
+        return 51 * round(val / 51)
+    assert len(hex6) == 6
+    rgb_ansi_dat = pathlib.Path(os.path.realpath(__file__)).parent / "../material/RGB_ANSI.py"
+    with rgb_ansi_dat.open("r") as f:
+        RGB_ANSI = eval(f.read())
+    rgb_tuple = (ab2int(hex6[:2]), ab2int(hex6[2:4]), ab2int(hex6[4:6]))
+    return RGB_ANSI[rgb_tuple]
+
+
+if __name__ == "__main__":
+
+    logging.basicConfig()
+    logger = logging.getLogger("gits")
+    logger.verbose = logger.debug  # type: ignore
+    logger.setLevel(10)
+
+    gm = GitsManager()
+
+    parser = argparse.ArgumentParser(description="Arguments for gits")
+    parser.add_argument(
+        "--config", "-c", help="json config for the target repositories")
+    parser.add_argument("--max-concurrent", type=int, default=-1,
+                        help="Maximum concurrent tasks for running simultaneously")
+    subparsers = parser.add_subparsers(dest='command', help='Sub-command help')
+
+    parser_config = subparsers.add_parser("config", help="Action for gits runtime config file")
+    parser_config.add_argument("config_action", choices=["gen", "show", "add", "remove"], help="action for config, supporting gen, add")
+    parser_config.add_argument(
+        "config_action_args", nargs="*", help="action for config, supporting gen, add")
+    parser_config.add_argument("--overwrite", action="store_true", default=False,
+                               help="Overwrite existing gitsrc file for config_action:gen")
+
+    parser_status = subparsers.add_parser(
+        "status", help="Action for status of repositories")
+    parser_status.add_argument(
+        "--repos", "-r", nargs="+", default=None, help="target repositories")
+
+    parser_exec = subparsers.add_parser("exec", help="Action for executing commands")
+    parser_exec.add_argument("command", help="Command to be executed in target repositories")
+    parser_exec.add_argument("--repos", "-r", nargs="+", default=None, help="target repositories")
+    parser_exec.add_argument("--show-eo", action="store_true", default=False, help="Show stdout & stderr for each command execution")
+
+    parser_exec = subparsers.add_parser("push", help="Call git push in batch")
+    parser_exec.add_argument("remote", nargs="?", default="", help="Remote repo name")
+    parser_exec.add_argument("branch", nargs="?", default="", help="Remote repo branch name")
+    parser_exec.add_argument("--repos", "-r", nargs="+", default=None, help="target repositories")
+
+    parser_exec = subparsers.add_parser("pull", help="Call git pull in batch")
+    parser_exec.add_argument("remote", nargs="?", default="", help="Remote repo name")
+    parser_exec.add_argument("branch", nargs="?", default="", help="Remote repo branch name")
+    parser_exec.add_argument("--repos", "-r", nargs="+", default=None, help="target repositories")
+
+    parser_exec = subparsers.add_parser("label", help="Operations concerning labels of repositories")
+    parser_exec.add_argument("label_action", choices=["add"], help="Available actions for command:label")
+    parser_exec.add_argument("--label", required=True, help="target label")
+    parser_exec.add_argument("--repos", "-r", nargs="+", default=None, help="target repositories")
+
+    args = parser.parse_args()
+
+    if args.max_concurrent == -1:
+        ncpus = os.cpu_count()
+        if ncpus is None:
+            args.max_concurrent = 2
+        else:
+            args.max_concurrent = ncpus // 2
+
+    if args.command == "config":
+        if args.config_action == "gen":
+            gm.config_gen(mode="w" if args.overwrite else "a")
+        elif args.config_action == "show":
+            gm.config_show()
+        elif args.config_action == "add":
+            assert len(args.config_action_args) > 0
+            gm.config_add(args.config_action_args)
+        elif args.config_action == "remove":
+            assert len(args.config_action_args) > 0
+            gm.config_remove(args.config_action_args)
+    elif args.command == "status":
+        gm.status_show(args.repos)
+    elif args.command == "exec":
+        gm.exec(args.command, args.repos, show_eo=args.show_eo)
+    elif args.command == "push":
+        gm.push(args.remote, args.branch, labels=args.repos)
+    elif args.command == "pull":
+        gm.pull(args.remote, args.branch, labels=args.repos)
+    elif args.command == "label":
+        if args.label_action == "add":
+            gm.label_add(args.label, args.repos)

@@ -1,0 +1,11 @@
+
+ade.*
+ade
+__pycache__/
+export.Linux/
+export.Windows/
+
+
+# branch: main
+/dev/
+
