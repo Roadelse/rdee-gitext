@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# author: Roadelse
+# e-mail: roadelse@qq.com#
+
+# Last Update: @2024-11-28
+
+# from: Claude-3.5-Sonnet
+
+# note: will be executed before commit at the repository home
+
+VERSION="v$(date +%y.%m.%d)"
+
+echo $VERSION > VERSION
+
+git add VERSION
+
+# avoid infinite cycling if only VERSION is changed
+if [ "$(git diff --cached --numstat | wc -l)" -eq 1 ] && \
+   [ "$(git diff --cached --numstat VERSION | wc -l)" -eq 1 ]; then
+    exit 0
+fi
